@@ -3,11 +3,10 @@ from typing import List, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from opendg.graph import DGBatch, DGraph
 from opendg.loader import DGNeighborLoader
-from opendg.nn import TemporalAttention
+from opendg.nn import TemporalAttention, Time2Vec
 from opendg.util.perf import Usage
 from opendg.util.seed import seed_everything
 
@@ -48,7 +47,8 @@ class TGAT(nn.Module):
     ) -> None:
         super().__init__()
         self.num_layers = num_layers
-        self.edge_predictor = EdgePredictor(dim=embed_dim)
+        self.edge_predictor = LinkPredictor(dim=embed_dim)
+        self.time_encoder = Time2Vec(time_dim=time_dim)
         self.attn = nn.ModuleList(
             [
                 TemporalAttention(
@@ -62,37 +62,41 @@ class TGAT(nn.Module):
                 for i in range(num_layers)
             ]
         )
-        # TODO: Temporary
-        self.src_embed = torch.rand(embed_dim)
-        self.dst_embed = torch.rand(embed_dim)
-        self.neg_embed = torch.rand(embed_dim)
 
     def forward(self, batch: DGBatch) -> Tuple[torch.Tensor, torch.Tensor]:
-        src, dst, time = batch.src, batch.dst, batch.time
-        node_feats, edge_feats = batch.node_feats, batch.edge_feats
+        # batch.neg = torch.randint(0, 1337, (batch.dst.size(0),), dtype=torch.long)
+        # batch.n_id = torch.cat([batch.src, batch.dst, batch.neg]).unique()
 
-        # TODO: Get the negative edges
+        # nbrs = self.nbrs[batch.n_id]
+        # nodes = batch.n_id.view(-1, 1).repeat(1, self.size)
+        # n_id = torch.cat([batch.n_id, nbrs]).unique()
+        # edge_idx = torch.stack([nbrs, nodes])
+        # global_event_id = self.global_event_id[batch.n_id]
 
-        # TODO: TGAT Multi-hop forward pass
-        # out = self.attn(node_feats, time_feat, edge_feat, nbr_node_feat, nbr_time_feat, nbr_mask)
-        pos_prob = self.edge_predictor(self.src_embed, self.dst_embed)
-        neg_prob = self.edge_predictor(self.src_embed, self.neg_embed)
-        return pos_prob, neg_prob
+        # batch.joint_time = data.time[global_event_id]
+        # batch.joint_edge_feats = data.time[global_event_id]
+        # batch.edge_index
+
+        # z = gnn(edge_index, data.joint_time, data.joint_edge_feats)
+        # z = self.attn(
+        #    data.joint_node_feats, data.joint_time, data.joint_edge_feats, nbr_node_feat, nbr_time_feat, nbr_mask
+        # )
+        pos_out = self.edge_predictor(z[batch.src_mask], z[batch.dst_mask])
+        neg_out = self.edge_predictor(z[batch.src_mask], z[batch.neg_mask])
+        return pos_out, neg_out
 
 
-class EdgePredictor(nn.Module):
+class LinkPredictor(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
-        self.dim = dim
-        self.src_fc = nn.Linear(dim, dim)
-        self.dst_fc = nn.Linear(dim, dim)
-        self.out_fc = nn.Linear(dim, 1)
+        self.lin_src = nn.Linear(dim, dim)
+        self.lin_dst = nn.Linear(dim, dim)
+        self.lin_out = nn.Linear(dim, 1)
 
-    def forward(self, src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-        h_src = self.src_fc(src)
-        h_dst = self.dst_fc(dst)
-        h_out = F.relu(h_src + h_dst)
-        return self.out_fc(h_out)
+    def forward(self, z_src: torch.Tensor, z_dst: torch.Tensor) -> torch.Tensor:
+        h = self.lin_src(z_src) + self.lin_dst(z_dst)
+        h = h.relu()
+        return self.lin_out(h)
 
 
 def train(
@@ -114,9 +118,8 @@ def train(
         for batch in DGNeighborLoader(train_dg, n_nbrs, bsize):
             opt.zero_grad()
             pred_pos, pred_neg = model(batch)
-            loss = criterion(pred_pos, torch.ones_like(pred_pos)) + criterion(
-                pred_neg, torch.zeros_like(pred_neg)
-            )
+            loss = criterion(pred_pos, torch.ones_like(pred_pos))
+            loss += criterion(pred_neg, torch.ones_like(pred_neg))
             loss.backward()
             opt.step()
             e_loss += float(loss)
@@ -132,7 +135,7 @@ def eval(dg: DGraph, model: nn.Module, n_nbrs: List[int], bsize: int) -> float:
     model.eval()
     perf_list = []
     for batch in DGNeighborLoader(dg, n_nbrs, bsize):
-        prob_pos, prob_neg = model(batch)
+        pos_out, neg_out = model(batch)
         perf_list.append(0)  # TODO: MRR eval
     return sum(perf_list) / len(perf_list)
 
